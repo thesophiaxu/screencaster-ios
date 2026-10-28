@@ -1,0 +1,26 @@
+.DS_Store
+.build/
+DerivedData/
+**/xcuserdata/
+*.xcuserstate
+__pycache__/
+*.pyc
+TailscaleCore/build/
+TailscaleCore/Libtailscale.xcframework/
+Companion/MonitorConfig.swift
+Shared/MonitorToken.h
+# Device credentials, captures and local diagnostics never belong in git.
+private/
+*pairing*.plist
+*.mobileprovision
+*.p12
+*.p8
+*.key
+*.ipa
+*.xcarchive/
+*.mp4
+*.mov
+benchmarks/
+evidence/
+.env
+.env.*

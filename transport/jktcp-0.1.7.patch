@@ -1,0 +1,224 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -477,3 +477,5 @@
+         handle.close().await.ok();
+     }
+ }
++
++pub mod phantom_diag;
+--- a/src/adapter.rs
++++ b/src/adapter.rs
+@@ -12,7 +12,7 @@
+ //! See the [crate-level documentation](crate) for a full comparison.
+ 
+ use std::{
+-    collections::{HashMap, VecDeque},
++    collections::{BTreeMap, HashMap, VecDeque},
+     io::ErrorKind,
+     net::IpAddr,
+     sync::Arc,
+@@ -44,7 +44,7 @@
+ /// Initial retransmission timeout in milliseconds. Doubles on each retry.
+ const INITIAL_RTO_MS: u64 = 200;
+ 
+-const OUR_WSCALE: u8 = 8;
++const OUR_WSCALE: u8 = 5; // ~2 MiB receive/reassembly window for the extension.
+ 
+ /// Default cap on bytes in flight per connection, in bytes. Overridden via
+ /// [`Adapter::set_send_window`].
+@@ -86,6 +86,10 @@
+     host_port: u16,
+     peer_port: u16,
+     read_buffer: Vec<u8>,
++    // Absolute offsets avoid ordering errors when the 32-bit sequence wraps.
++    receive_offset: u64,
++    reordered: BTreeMap<u64, Vec<u8>>,
++    reordered_bytes: usize,
+     write_buffer: VecDeque<u8>,
+     status: ConnectionStatus,
+     /// Segments we have sent but not yet received an ACK for, in send order.
+@@ -110,6 +114,9 @@
+             host_port,
+             peer_port,
+             read_buffer: Vec::new(),
++            receive_offset: 0,
++            reordered: BTreeMap::new(),
++            reordered_bytes: 0,
+             write_buffer: VecDeque::new(),
+             status: ConnectionStatus::WaitingForSyn,
+             unacked: VecDeque::new(),
+@@ -118,6 +125,44 @@
+             peer_wscale: None,
+         }
+     }
++    fn receive_payload(&mut self, seq: u32, payload: &[u8]) {
++        let delta = seq.wrapping_sub(self.ack) as i32 as i64;
++        let skip = if delta < 0 { (-delta) as usize } else { 0 };
++        if skip >= payload.len() { return; }
++        let data = &payload[skip..];
++        let offset = self.receive_offset + delta.max(0) as u64;
++        // Matches our advertised scaled receive window, with a hard allocation cap.
++        const LIMIT: usize = (u16::MAX as usize - 1) << OUR_WSCALE;
++        if delta.max(0) as usize + data.len() > LIMIT { return; }
++        if offset == self.receive_offset {
++            self.read_buffer.extend_from_slice(data);
++            self.ack = self.ack.wrapping_add(data.len() as u32);
++            self.receive_offset += data.len() as u64;
++        } else {
++            let old_len = self.reordered.get(&offset).map_or(0, Vec::len);
++            if old_len >= data.len() || self.reordered_bytes - old_len + data.len() > LIMIT { return; }
++            self.reordered_bytes = self.reordered_bytes - old_len + data.len();
++            self.reordered.insert(offset, data.to_vec());
++            crate::phantom_diag::add(9, data.len() as u64);
++            crate::phantom_diag::COUNTERS[11].fetch_max(self.reordered_bytes as u64, std::sync::atomic::Ordering::Relaxed);
++        }
++        // An arriving gap can release many buffered segments. Trim overlaps rather
++        // than discarding a segment whose beginning has already been acknowledged.
++        while let Some((&offset, _)) = self.reordered.first_key_value() {
++            if offset > self.receive_offset { break; }
++            let data = self.reordered.pop_first().unwrap().1;
++            self.reordered_bytes -= data.len();
++            let skip = (self.receive_offset - offset) as usize;
++            if skip < data.len() {
++                let tail = &data[skip..];
++                self.read_buffer.extend_from_slice(tail);
++                self.ack = self.ack.wrapping_add(tail.len() as u32);
++                self.receive_offset += tail.len() as u64;
++                crate::phantom_diag::add(10, tail.len() as u64);
++            }
++        }
++    }
++
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -671,6 +716,16 @@
+         let mut ack_me = None;
+ 
+         if let Some(state) = self.states.get_mut(&res.destination_port) {
++            if !res.payload.is_empty() {
++                crate::phantom_diag::add(0, res.payload.len() as u64);
++                crate::phantom_diag::set(4, res.sequence_number as u64);
++                crate::phantom_diag::set(5, state.ack as u64);
++                crate::phantom_diag::set(6, res.payload.len() as u64);
++                crate::phantom_diag::set(8, res.destination_port as u64);
++                if res.sequence_number == state.ack { crate::phantom_diag::add(1, res.payload.len() as u64); }
++                else if seq_lt(res.sequence_number, state.ack) { crate::phantom_diag::add(2,1); }
++                else { crate::phantom_diag::add(3,1); }
++            }
+             // ------------------------------------------------------------------
+             // ACK processing: advance the unacked window.
+             // The peer's acknowledgment_number is the next seq they expect from us,
+@@ -738,25 +793,9 @@
+                         // ------------------------------------------------------
+                         // Data segment: enforce in-order delivery.
+                         // ------------------------------------------------------
+-                        if res.sequence_number == state.ack {
+-                            // Expected: accept.
+-                            state.ack = state.ack.wrapping_add(res.payload.len() as u32);
+-                            state.read_buffer.extend(&res.payload);
+-                            ack_me = Some(res.destination_port);
+-                        } else if seq_lt(res.sequence_number, state.ack) {
+-                            // Duplicate (already received): re-ACK, don't buffer.
+-                            debug!(
+-                                "duplicate data seq={} expected={} hp={}",
+-                                res.sequence_number, state.ack, res.destination_port
+-                            );
+-                            ack_me = Some(res.destination_port);
+-                        } else {
+-                            // Out-of-order: drop silently.
+-                            debug!(
+-                                "out-of-order seq={} expected={} hp={}",
+-                                res.sequence_number, state.ack, res.destination_port
+-                            );
+-                        }
++                        state.receive_payload(res.sequence_number, &res.payload);
++                        // Duplicate ACKs tell the sender about gaps immediately.
++                        ack_me = Some(res.destination_port);
+                     }
+ 
+                     // FIN: peer is closing; FIN consumes one sequence number.
+@@ -778,7 +817,7 @@
+         }
+ 
+         if let Some(hp) = ack_me {
+-            self.ack(hp).await?;
++            self.ack(hp).await?; crate::phantom_diag::add(7,1);
+         }
+         Ok(())
+     }
+@@ -1473,7 +1512,7 @@
+     }
+ 
+     #[tokio::test]
+-    async fn out_of_order_packet_dropped() {
++    async fn out_of_order_packet_buffered_and_gap_acked() {
+         let (adapter_end, test_end) = tokio::io::duplex(1 << 16);
+         let (mut test_rx, mut test_tx) = tokio::io::split(test_end);
+         let mut adapter = Adapter::new(
+@@ -1508,12 +1547,14 @@
+             "out-of-order data must not be buffered"
+         );
+ 
+-        // No ACK should have been written to the transport.
+-        let no_ack = tokio::time::timeout(Duration::from_millis(10), read_pkt(&mut test_rx)).await;
+-        assert!(
+-            no_ack.is_err(),
+-            "out-of-order packet must not trigger an ACK"
+-        );
++        let ack = read_pkt(&mut test_rx).await;
++        assert_eq!(ack.acknowledgment_number, PEER_ISN + 1);
++        // Fill the gap: both the new prefix and previously buffered tail must arrive.
++        let gap = vec![b'x'; 99];
++        adapter.process_tcp_packet_from_payload(&tcp_seg(hp, PEER_ISN + 1, 0,
++            TcpFlags { ack: true, psh: true, ..Default::default() }, &gap)).await.unwrap();
++        let mut expected = gap; expected.extend_from_slice(b"ooo");
++        assert_eq!(adapter.uncache_all(hp).unwrap(), expected);
+     }
+ 
+     /// A duplicate segment (seq < expected, already received) is re-ACKed but
+@@ -1591,4 +1632,35 @@
+             "duplicate payload must not be re-buffered"
+         );
+     }
++    #[tokio::test]
++    async fn phantom_accepts_new_tail_of_overlapping_retransmission() {
++        let (adapter_end, test_end) = tokio::io::duplex(1 << 16);
++        let (mut test_rx, mut test_tx) = tokio::io::split(test_end);
++        let mut adapter = Adapter::new(Box::new(TestTransport(adapter_end)), IpAddr::V6(HOST_IP), IpAddr::V6(PEER_IP));
++        let hp = handshake(&mut adapter, &mut test_rx, &mut test_tx).await;
++        let seq = adapter.states[&hp].ack;
++        let ack = adapter.states[&hp].seq;
++        let flags = TcpFlags { ack: true, psh: true, ..Default::default() };
++        let first = tcp_seg(hp, seq, ack, flags.clone(), b"abcd");
++        adapter.process_tcp_packet_from_payload(&first).await.unwrap();
++        assert_eq!(adapter.uncache_all(hp).unwrap(), b"abcd");
++        let overlap = tcp_seg(hp, seq.wrapping_add(2), ack, flags, b"cdefgh");
++        adapter.process_tcp_packet_from_payload(&overlap).await.unwrap();
++        assert_eq!(adapter.uncache_all(hp).unwrap(), b"efgh", "Must retain unseen suffix even if beginning was already ACKed");
++        assert_eq!(adapter.states[&hp].ack, seq.wrapping_add(8));
++    }
++
++    #[test]
++    fn phantom_reorders_across_sequence_wrap_and_trims_overlap() {
++        let mut state = ConnectionState::new(123, 456);
++        state.ack = u32::MAX - 3;
++        state.receive_payload(2, b"ghij");
++        state.receive_payload(0, b"efgh");
++        state.receive_payload(u32::MAX - 3, b"abcd");
++        assert_eq!(state.read_buffer, b"abcdefghij");
++        assert_eq!(state.ack, 6);
++        assert!(state.reordered.is_empty());
++        assert_eq!(state.reordered_bytes, 0);
++    }
++
+ }
+--- /dev/null
++++ b/src/phantom_diag.rs
+@@ -0,0 +1,6 @@
++use std::sync::atomic::{AtomicU64, Ordering};
++pub static COUNTERS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
++pub fn add(i: usize, n: u64) { COUNTERS[i].fetch_add(n, Ordering::Relaxed); }
++pub fn set(i: usize, n: u64) { COUNTERS[i].store(n, Ordering::Relaxed); }
++#[unsafe(no_mangle)]
++pub extern "C" fn phantom_tcp_counter(i: usize) -> u64 { COUNTERS.get(i).map(|x| x.load(Ordering::Relaxed)).unwrap_or(0) }

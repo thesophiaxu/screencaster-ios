@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>phantom-monitor</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>phantom-worker</string>
+	</array>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>NETestAppMapping</key>
+	<dict>
+		<key>B18AD9D7-5D65-49F5-A94D-25181C17F303</key>
+		<array>
+			<string>me.sophiaxu.phantommonitor</string>
+		</array>
+	</dict>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Connect to this iPhone’s developer service for the local capture diagnostic.</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,461 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -8,3 +8,6 @@
+ codegen-units = 1
+ lto = true
+ panic = "abort"
++
++[patch.crates-io]
++jktcp = { path = "../jktcp-0.1.7" }
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1366,8 +1366,6 @@
+ [[package]]
+ name = "jktcp"
+ version = "0.1.7"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "4d3b9e59938be47d261173086c65a9352fe048951bc502109e7595b70b60cd98"
+ dependencies = [
+  "futures",
+  "getrandom 0.3.4",
+--- a/idevice/src/lib.rs
++++ b/idevice/src/lib.rs
+@@ -1107,3 +1107,5 @@
+         }
+     }
+ }
++
++pub mod phantom_diag;
+--- /dev/null
++++ b/idevice/src/phantom_diag.rs
+@@ -0,0 +1,6 @@
++use std::sync::atomic::{AtomicU64, Ordering};
++pub static COUNTERS: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
++pub fn add(i: usize, n: u64) { COUNTERS[i].fetch_add(n, Ordering::Relaxed); }
++pub fn set(i: usize, n: u64) { COUNTERS[i].store(n, Ordering::Relaxed); }
++#[unsafe(no_mangle)]
++pub extern "C" fn phantom_transport_counter(i: usize) -> u64 { COUNTERS.get(i).map(|x| x.load(Ordering::Relaxed)).unwrap_or(0) }
+--- a/idevice/src/remote_pairing/tls_psk.rs
++++ b/idevice/src/remote_pairing/tls_psk.rs
+@@ -610,7 +610,7 @@
+ 
+                 match decrypt_record(&this.keys, true, this.read_seq, ct, &body) {
+                     Ok(plaintext) => {
+-                        this.read_seq += 1;
++                        this.read_seq += 1; crate::phantom_diag::add(1, plaintext.len() as u64);
+                         let n = buf.remaining().min(plaintext.len());
+                         buf.put_slice(&plaintext[..n]);
+                         if n < plaintext.len() {
+@@ -642,6 +642,7 @@
+                     if n == 0 {
+                         return Poll::Ready(Ok(())); // EOF
+                     }
++                    crate::phantom_diag::add(0, n as u64);
+                     this.pending_record.extend_from_slice(&tmp[..n]);
+                     // Loop back to check if we now have a complete record
+                 }
+@@ -690,8 +691,11 @@
+                 Poll::Ready(Err(e))
+             }
+             Poll::Pending => {
+-                // Buffer the entire record for later flush
+-                this.write_buf = record;
++                crate::phantom_diag::add(2,1);
++                // Pending means the underlying writer accepted zero bytes. Do not
++                // retain this record and then encrypt the same plaintext again on
++                // the next poll. No TLS sequence number has been sent yet.
++                this.write_seq -= 1;
+                 Poll::Pending
+             }
+         }
+@@ -718,3 +722,30 @@
+         Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+     }
+ }
++
++#[cfg(test)]
++mod phantom_regression {
++    use super::*;
++    #[derive(Debug, Default)]
++    struct BackpressuredWriter { blocked_once: bool, bytes: Vec<u8> }
++    impl AsyncRead for BackpressuredWriter {
++        fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, _: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> { Poll::Pending }
++    }
++    impl AsyncWrite for BackpressuredWriter {
++        fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
++            if !self.blocked_once { self.blocked_once=true; cx.waker().wake_by_ref(); return Poll::Pending; }
++            self.bytes.extend_from_slice(data); Poll::Ready(Ok(data.len()))
++        }
++        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> { Poll::Ready(Ok(())) }
++        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> { Poll::Ready(Ok(())) }
++    }
++    #[tokio::test]
++    async fn phantom_pending_write_must_not_duplicate_record() {
++        let keys = KeyBlock { client_mac_key: vec![0;48], server_mac_key: vec![0;48], client_write_key: vec![0;32], server_write_key: vec![0;32], suite: CipherSuite::Aes256CbcSha384 };
++        let mut stream = TlsPskStream { inner: BackpressuredWriter::default(), keys, write_seq:0, read_seq:0, read_buf:vec![], pending_record:vec![], pending_record_total:0, write_buf:vec![] };
++        stream.write_all(b"one packet").await.unwrap(); stream.flush().await.unwrap();
++        let mut offset=0; let mut records=0;
++        while offset < stream.inner.bytes.len() { let bytes=&stream.inner.bytes; let len=u16::from_be_bytes([bytes[offset+3],bytes[offset+4]]) as usize; offset+=5+len; records+=1; }
++        assert_eq!(records,1,"Backpressure must not send the same plaintext twice");
++    }
++}
+--- a/idevice/src/services/dvt/message.rs
++++ b/idevice/src/services/dvt/message.rs
+@@ -587,6 +587,7 @@
+         // loop for deal with multiple fragments
+         let mheader = loop {
+             let mut buf = [0u8; 32];
++            crate::phantom_diag::set(3,1);
+             reader.read_exact(&mut buf).await?;
+             let header = MessageHeader {
+                 magic: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+@@ -608,19 +609,34 @@
+                 },
+                 expects_reply: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]) == 1,
+             };
++            crate::phantom_diag::add(4,1);
++            crate::phantom_diag::set(5,header.length as u64);
++            crate::phantom_diag::set(6,header.identifier as u64);
++            crate::phantom_diag::set(7,header.fragment_id as u64);
+             if header.fragment_count > 1 && header.fragment_id == 0 {
+                 // when reading multiple message fragments, the first fragment contains only a message header.
+                 continue;
+             }
+-            let mut buf = vec![0u8; header.length as usize];
+-            reader.read_exact(&mut buf).await?;
+-            packet_data.extend(buf);
++            // Read fragments into their final allocation; screenshots can be 8+ MiB.
++            let offset = packet_data.len();
++            let end = offset.checked_add(header.length as usize)
++                .filter(|n| *n <= 32 * 1024 * 1024)
++                .ok_or_else(|| IdeviceError::UnexpectedResponse("DTX message exceeds 32 MiB budget".into()))?;
++            if header.fragment_count == 0 {
++                return Err(IdeviceError::UnexpectedResponse("DTX has zero fragments".into()));
++            }
++            packet_data.reserve_exact(end - offset);
++            packet_data.resize(end, 0);
++            crate::phantom_diag::set(3,2);
++            reader.read_exact(&mut packet_data[offset..end]).await?;
++            crate::phantom_diag::add(8,header.length as u64);
+             if header.fragment_id == header.fragment_count - 1 {
+                 break header;
+             }
+         };
++        crate::phantom_diag::set(3,3);
+         // read the payload header
+-        let buf = &packet_data[0..16];
++        let buf = packet_data.get(..16).ok_or(IdeviceError::NotEnoughBytes(packet_data.len(), 16))?;
+         let pheader = PayloadHeader {
+             msg_type: buf[0],
+             flags_a: buf[1],
+@@ -630,31 +646,23 @@
+             total_length: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+             flags: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+         };
++        let aux_end = 16 + pheader.aux_length as usize;
++        let data_end = 16 + pheader.total_length as usize;
++        if aux_end > data_end || data_end > packet_data.len() {
++            return Err(IdeviceError::UnexpectedResponse("invalid DTX payload lengths".into()));
++        }
+         let aux = if pheader.aux_length > 0 {
+-            let buf = packet_data[16..(16 + pheader.aux_length as usize)].to_vec();
+-            Some(Aux::from_bytes(buf)?)
+-        } else {
+-            None
++            Some(Aux::from_bytes(packet_data[16..aux_end].to_vec())?)
++        } else { None };
++        packet_data.truncate(data_end);
++        packet_data.drain(..aux_end);
++        // Preserve raw bytes for clients such as energy_monitor without cloning.
++        let data = if packet_data.is_empty() { None } else {
++            Some(decode_payload(&packet_data)?)
+         };
+-        // read the data
+-        let need_len = (pheader.total_length - pheader.aux_length) as usize;
+-        let buf = packet_data
+-            [(pheader.aux_length + 16) as usize..pheader.aux_length as usize + 16 + need_len]
+-            .to_vec();
+-        let raw_data = if buf.is_empty() {
+-            None
+-        } else {
+-            Some(buf.clone())
+-        };
+-        let data = if buf.is_empty() {
+-            None
+-        } else {
+-            Some(
+-                ns_keyed_archive::decode::from_bytes(&buf)
+-                    .map_err(super::errors::DvtError::from)?,
+-            )
+-        };
+-
++        let raw_data = if packet_data.is_empty() { None } else { Some(packet_data) };
++
++        crate::phantom_diag::add(9,1);
+         Ok(Message {
+             message_header: mheader,
+             payload_header: pheader,
+@@ -808,3 +816,55 @@
+             .finish()
+     }
+ }
++
++// Move a root NSData out of the plist object table. The generic archive decoder
++// clones it while retaining the table, creating another full screenshot allocation.
++fn decode_payload(bytes: &[u8]) -> Result<Value, IdeviceError> {
++    if let Ok(Value::Dictionary(mut archive)) = Value::from_reader(Cursor::new(bytes)) {
++        let root = archive.get("$top").and_then(Value::as_dictionary)
++            .and_then(|d| d.get("root")).and_then(Value::as_uid).map(|u| u.get() as usize);
++        if let (Some(mut objects), Some(mut index)) = (archive.remove("$objects").and_then(Value::into_array), root) {
++            for _ in 0..objects.len() {
++                match objects.get(index) {
++                    Some(Value::Uid(uid)) => { index = uid.get() as usize; continue; }
++                    Some(Value::Data(_)) => return Ok(std::mem::replace(&mut objects[index], Value::Boolean(false))),
++                    Some(Value::Dictionary(d)) => {
++                        let data_class = d.get("$class").and_then(Value::as_uid)
++                            .and_then(|u| objects.get(u.get() as usize)).and_then(Value::as_dictionary)
++                            .and_then(|c| c.get("$classname")).and_then(Value::as_string)
++                            .is_some_and(|c| c.contains("Data"));
++                        if data_class {
++                            if let Value::Dictionary(d) = &mut objects[index] {
++                                if let Some(Value::Data(data)) = d.remove("NS.data") { return Ok(Value::Data(data)); }
++                            }
++                        }
++                    }
++                    _ => {}
++                }
++                break;
++            }
++        }
++    }
++    Ok(ns_keyed_archive::decode::from_bytes(bytes).map_err(super::errors::DvtError::from)?)
++}
++
++#[cfg(test)]
++mod phantom_memory_tests {
++    use super::*;
++    #[tokio::test]
++    async fn large_data_roundtrip_preserves_archive_and_payload() {
++        let bytes = vec![0x93; 8 * 1024 * 1024];
++        let m = Message::new(MessageHeader::new(0,1,7,1,2,false), PayloadHeader::method_invocation(),None,Some(Value::Data(bytes.clone())));
++        let wire=m.serialize();
++        let decoded=Message::from_reader(&mut wire.as_slice()).await.unwrap();
++        assert_eq!(decoded.data,Some(Value::Data(bytes)));
++        assert!(decoded.raw_data.unwrap().starts_with(b"bplist00"));
++    }
++    #[tokio::test]
++    async fn truncated_payload_header_returns_error() {
++        let m=Message::new(MessageHeader::new(0,1,7,1,2,false),PayloadHeader::method_invocation(),None,None);
++        let mut wire=m.serialize();
++        wire[12..16].copy_from_slice(&4u32.to_le_bytes());wire.truncate(36);
++        assert!(Message::from_reader(&mut wire.as_slice()).await.is_err());
++    }
++}
+--- a/idevice/src/services/dvt/remote_server.rs
++++ b/idevice/src/services/dvt/remote_server.rs
+@@ -834,7 +834,7 @@
+ 
+             {
+                 let mut messages = queue.messages.lock().await;
+-                if let Some(msg) = messages.pop_front() {
++                if let Some(msg) = messages.pop_front() { crate::phantom_diag::add(11,1);
+                     return Ok(msg);
+                 }
+             }
+@@ -863,13 +863,13 @@
+                 match Message::from_reader(&mut reader).await {
+                     Ok(msg) => {
+                         debug!("[{}] Read message: {msg:#?}", label);
+-                        if Self::dispatch_pending_reply(&shared, msg.clone()).await {
++                        if Self::dispatch_pending_reply(&shared, &msg).await {
+                             continue;
+                         }
+                         if Self::handle_control_message(&shared, &msg).await {
+                             continue;
+                         }
+-                        if Self::dispatch_to_handler(&shared, msg.clone()).await {
++                        if Self::dispatch_to_handler(&shared, &msg).await {
+                             continue;
+                         }
+                         Self::enqueue_message(&shared, msg).await;
+@@ -1074,7 +1074,7 @@
+             let notify = &queue.notify;
+             {
+                 let mut messages = queue.messages.lock().await;
+-                messages.push_back(msg);
++                messages.push_back(msg); crate::phantom_diag::add(10,1);
+             }
+             notify.notify_waiters();
+         } else {
+@@ -1087,7 +1087,7 @@
+ 
+     async fn dispatch_to_handler(
+         shared: &Arc<RemoteServerShared<WriteHalf<R>>>,
+-        msg: Message,
++        msg: &Message,
+     ) -> bool {
+         if msg.message_header.conversation_index() != 0 {
+             return false;
+@@ -1107,7 +1107,7 @@
+         let conversation_index = msg.message_header.conversation_index();
+         let channel = msg.message_header.channel;
+ 
+-        match handler(msg).await {
++        match handler(msg.clone()).await {
+             Ok(IncomingHandlerOutcome::Unhandled) => false,
+             Ok(IncomingHandlerOutcome::HandledNoReply) => {
+                 if expects_reply
+@@ -1137,7 +1137,7 @@
+ 
+     async fn dispatch_pending_reply(
+         shared: &Arc<RemoteServerShared<WriteHalf<R>>>,
+-        msg: Message,
++        msg: &Message,
+     ) -> bool {
+         if msg.message_header.conversation_index() == 0 {
+             return false;
+@@ -1153,7 +1153,7 @@
+             return false;
+         };
+ 
+-        if sender.send(msg).is_err() {
++        if sender.send(msg.clone()).is_err() {
+             warn!("Reply waiter dropped before correlated reply was delivered");
+         }
+ 
+--- a/idevice/src/xpc/format.rs
++++ b/idevice/src/xpc/format.rs
+@@ -151,6 +151,17 @@
+ }
+ 
+ impl XPCObject {
++    /// Consume decoded objects so large screenshot data is not cloned again.
++    pub fn into_plist(self) -> plist::Value {
++        match self {
++            Self::Data(v) => plist::Value::Data(v),
++            Self::String(v) => plist::Value::String(v),
++            Self::Array(v) => plist::Value::Array(v.into_iter().map(Self::into_plist).collect()),
++            Self::Dictionary(v) => plist::Value::Dictionary(v.into_iter().map(|(k,v)|(k,v.into_plist())).collect()),
++            other => other.to_plist(),
++        }
++    }
++
+     pub fn to_plist(&self) -> plist::Value {
+         match self {
+             Self::Null => plist::Value::String("".into()),
+--- a/idevice/src/xpc/mod.rs
++++ b/idevice/src/xpc/mod.rs
+@@ -121,7 +121,7 @@
+                     && let Some(inner) = msg.message
+                     && !inner.as_dictionary().is_some_and(|d| d.is_empty())
+                 {
+-                    return Ok(inner.to_plist());
++                    return Ok(inner.into_plist());
+                 }
+             }
+             let (channel, chunk) = self.h2_client.read_any(&CHANNELS).await?;
+@@ -139,6 +139,8 @@
+             Ok(msg) => {
+                 let consumed = (XPC_WRAPPER_LEN + xpc_body_len(buf)).min(buf.len());
+                 buf.drain(..consumed);
++                // Release the whole encoded screenshot before handing off decoded data.
++                if buf.is_empty() && buf.capacity() > 256 * 1024 { *buf = Vec::new(); }
+                 Ok(Some(msg))
+             }
+             // Not enough bytes yet.
+@@ -161,7 +163,7 @@
+                         {
+                             continue;
+                         }
+-                        return Ok(inner.to_plist());
++                        return Ok(inner.into_plist());
+                     }
+                     None => continue,
+                 },
+--- a/ffi/src/core_device/mod.rs
++++ b/ffi/src/core_device/mod.rs
+@@ -5,3 +5,5 @@
+ pub mod diagnosticsservice;
+ pub mod file_service;
+ pub mod icon_service;
++
++pub mod phantom_screen;
+--- /dev/null
++++ b/ffi/src/core_device/phantom_screen.rs
+@@ -0,0 +1,76 @@
++//! Bounded, serial screenshot capture for Phantom's VPN extension.
++use std::{ptr::null_mut,time::{Duration,Instant}};
++use idevice::{IdeviceError,ReadWrite,provider::RsdProvider,core_device::CoreDeviceServiceClient};
++use crate::{IdeviceFfiError,ffi_err,run_sync,run_sync_local,core_device_proxy::AdapterHandle,rsd::RsdHandshakeHandle};
++use plist::Value;
++
++type Client=CoreDeviceServiceClient<Box<dyn ReadWrite>>;
++pub struct PhantomScreenHandle { info: Client, capture: Client }
++
++fn active_display(info: &Value) -> Option<(String,u32,String)> {
++    let ds=info.as_dictionary()?.get("displays")?.as_array()?;
++    let mut candidates=ds.iter().filter_map(|d| {
++        let d=d.as_dictionary()?;
++        if d.get("external")?.as_boolean()? || !d.get("active")?.as_boolean()? || d.get("backlightState")?.as_string()? != "activeOn" {return None;}
++        Some((d.get("uniqueId")?.as_string()?.to_owned(),u32::try_from(d.get("displayId")?.as_unsigned_integer()?).ok()?,d.get("currentOrientation")?.as_string()?.to_owned()))
++    });
++    let first=candidates.next()?;
++    if candidates.next().is_some() {None} else {Some(first)}
++}
++
++/// Safety: caller owns valid adapter/handshake handles and writable result pointer.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn phantom_screen_connect(provider:*mut AdapterHandle,handshake:*mut RsdHandshakeHandle,result:*mut *mut PhantomScreenHandle)->*mut IdeviceFfiError {
++    if provider.is_null() || handshake.is_null() || result.is_null(){return ffi_err!(IdeviceError::FfiInvalidArg);}
++    let connected: Result<PhantomScreenHandle,IdeviceError>=run_sync_local(async {
++        let provider=unsafe{&mut (*provider).0};let rsd=unsafe{&(*handshake).0};
++        let mut clients=Vec::new();
++        for name in ["com.apple.coredevice.deviceinfo","com.apple.coredevice.screencaptureservice"] {
++            let port=rsd.services.get(name).ok_or(IdeviceError::ServiceNotFound)?.port;
++            clients.push(CoreDeviceServiceClient::new(provider.connect_to_service_port(port).await?).await?);
++        }
++        let capture=clients.pop().unwrap();let info=clients.pop().unwrap();Ok(PhantomScreenHandle{info,capture})
++    });
++    match connected {Ok(h)=>{unsafe{*result=Box::into_raw(Box::new(h))};null_mut()},Err(e)=>ffi_err!(e)}
++}
++/// Safety: pointers are valid; returned bytes are freed with idevice_data_free.
++/// A null/zero image on success means no unambiguous active panel, or a fold/rotation race.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn phantom_screen_take(handle:*mut PhantomScreenHandle,data:*mut *mut u8,len:*mut usize,display:*mut u32,lookup_ms:*mut f64)->*mut IdeviceFfiError {
++    if handle.is_null()||data.is_null()||len.is_null()||display.is_null()||lookup_ms.is_null(){return ffi_err!(IdeviceError::FfiInvalidArg);}
++    unsafe{*data=null_mut();*len=0;*display=0;*lookup_ms=0.0;}
++    let h=unsafe{&mut *handle};
++    let response:Result<Option<(Vec<u8>,u32,f64)>,IdeviceError>=run_sync(async {
++        let work=async {
++            let start=Instant::now();
++            let before=h.info.invoke("com.apple.coredevice.feature.getdisplayinfo",None).await?;
++            let Some(selected)=active_display(&before) else{return Ok(None)};
++            let first_lookup=start.elapsed().as_secs_f64()*1000.0;
++            let mut input=plist::Dictionary::new();input.insert("displayUniqueID".into(),selected.0.clone().into());input.insert("requestedFormat".into(),"png".into());
++            let output=h.capture.invoke_with_plist_action("com.apple.coredevice.feature.capturescreenshot",input,"com.apple.coredevice.action.capturescreenshot").await?;
++            let mut output=output.into_dictionary().ok_or_else(||IdeviceError::UnexpectedResponse("screenshot output is not a dictionary".into()))?;
++            let bytes=output.remove("image").and_then(Value::into_data).ok_or_else(||IdeviceError::UnexpectedResponse("missing screenshot image".into()))?;
++            if bytes.len()>32*1024*1024{return Err(IdeviceError::UnexpectedResponse("screenshot exceeds 32 MiB budget".into()));}
++            let start=Instant::now();
++            let after=h.info.invoke("com.apple.coredevice.feature.getdisplayinfo",None).await?;
++            let lookup=first_lookup+start.elapsed().as_secs_f64()*1000.0;
++            if active_display(&after).as_ref()!=Some(&selected){return Ok(None);}
++            Ok(Some((bytes,selected.1,lookup)))
++        };
++        tokio::time::timeout(Duration::from_secs(8),work).await.map_err(|_|IdeviceError::UnexpectedResponse("active-display screenshot timed out".into()))?
++    });
++    match response {
++        Ok(Some((bytes,id,ms)))=>{let mut bytes=bytes.into_boxed_slice();unsafe{*len=bytes.len();*data=bytes.as_mut_ptr();*display=id;*lookup_ms=ms;}std::mem::forget(bytes);null_mut()},
++        Ok(None)=>null_mut(),Err(e)=>ffi_err!(e)
++    }
++}
++/// Safety: handle is null or owned by caller and no capture is in progress.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn phantom_screen_free(handle:*mut PhantomScreenHandle){if !handle.is_null(){drop(unsafe{Box::from_raw(handle)});}}
++
++#[cfg(test)] mod tests {
++ use super::*;
++ fn display(id:u32,active:bool)->Value {let mut d=plist::Dictionary::new();d.insert("external".into(),false.into());d.insert("active".into(),active.into());d.insert("backlightState".into(),"activeOn".into());d.insert("uniqueId".into(),id.to_string().into());d.insert("displayId".into(),id.into());d.insert("currentOrientation".into(),"rot0".into());d.into()}
++ fn info(displays:Vec<Value>)->Value{let mut d=plist::Dictionary::new();d.insert("displays".into(),Value::Array(displays));d.into()}
++ #[test] fn active_panel_selection_fails_closed(){assert_eq!(active_display(&info(vec![display(1,false),display(2,true)])).unwrap().1,2);assert!(active_display(&info(vec![display(1,true),display(2,true)])).is_none());assert!(active_display(&info(vec![display(1,false)])).is_none());}
++}
