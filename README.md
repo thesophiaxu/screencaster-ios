@@ -1,6 +1,13 @@
 # screencaster-ios
 
-An experimental, on-device iPhone screen recorder for personal and internal use, with a SwiftUI companion for recording controls, history, clip playback and file management. A Packet Tunnel VPN extension captures only the active display while unlocked, at up to **1 fps**, downsamples to half width and height, and saves local hardware-encoded HEVC clips of approximately one minute. Recording is enabled by default and resumes when the VPN starts, including through VPN On Demand; optional Tailscale routing and browser sign-in run in the same extension. The current path uses paired developer services rather than XCTest, so it does not start a UI automation session. The Xcode project and app retain their original “Phantom” names.
+> [!NOTE]
+> **Entirely vibe-coded**
+>
+> This app is entirely vibe-coded. Currently it's very buggy, so you should use it at your discretion. I'll fix bugs as I encounter them.
+>
+> Below is the AI-generated README.
+
+An experimental, on-device iPhone screen recorder for personal and internal use, using on-device developer tools for always-on and imperceptible recording. A Packet Tunnel VPN extension captures only the active display while unlocked, at up to **1 fps**, downsamples to half width and height, and saves local hardware-encoded HEVC clips. optional Tailscale routing and browser sign-in run in the same extension. at a mostly acceptible cost to battery life.
 
 ## Prerequisites
 
